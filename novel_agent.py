@@ -1,9 +1,11 @@
 import os
 from typing import Dict, List, Optional, TypedDict, Annotated
 from dotenv import load_dotenv
-from langgraph.graph import StateGraph, END
+from langgraph.graph import StateGraph, END, START
 from pydantic import BaseModel
 from dashscope import Generation
+from datetime import datetime
+import openai
 
 # 加载环境变量
 load_dotenv()
@@ -21,22 +23,21 @@ class NovelState(TypedDict):
 class NovelConcept(BaseModel):
     """小说概念模型"""
     title: str = ""
-    genre: str = ""
-    main_theme: str = ""
-    target_audience: str = ""
-    key_plot_points: List[str] = []
-    main_characters: List[Dict[str, str]] = []
-    setting: str = ""
-    style: str = ""
-    word_count_target: int = 0
-    additional_notes: str = ""
+    logline: str = "" # 故事一句话概括
+    genre: str = "" # 类型 (例如：科幻、奇幻、推理)
+    target_audience: str = "" # 目标读者
+    key_plot_points: List[str] = [] # 关键情节
+    main_characters: List[Dict] = [] # 主要角色 (包含姓名、简介等)
+    setting: str = "" # 背景设定
+    style_and_tone: str = "" # 文风和语调
+    word_count_target: int = 0 # 目标字数
+    additional_notes: str = "" # 补充说明
 
 class ConceptState(TypedDict):
     """概念收集状态"""
     concept: NovelConcept
-    is_confirmed: bool
-    feedback: str
-    iteration_count: int
+    user_input: str # 用户输入
+    feedback_needed: bool # 是否需要用户反馈
 
 # 定义节点函数
 def discuss_outline(state: NovelState) -> NovelState:
@@ -82,7 +83,7 @@ def should_continue(state: NovelState) -> str:
 def generate_concept_with_ai(state: ConceptState) -> ConceptState:
     """使用 AI 生成小说概念"""
     print("\n=== AI 正在生成小说概念 ===")
-    
+
     # 构建提示词
     prompt = """请帮我生成一个完整的小说概念，包括以下要素：
 1. 标题
@@ -96,105 +97,125 @@ def generate_concept_with_ai(state: ConceptState) -> ConceptState:
 9. 关键情节点（至少5个）
 10. 其他补充说明
 
-请按照以下格式输出：
+请严格按照以下格式输出，确保每个字段都有对应的值，即使没有也用占位符表示（如：补充说明：无）：
 标题：[标题]
 类型：[类型]
 主题：[主题]
 目标读者：[目标读者]
 背景设定：[背景设定]
 写作风格：[写作风格]
-预计字数：[字数]
+预计字数：[字数，只包含数字]
 
 主要人物：
-1. [姓名] - [角色]：[特点]
-2. [姓名] - [角色]：[特点]
-3. [姓名] - [角色]：[特点]
+[姓名] - [角色]：[特点]
+[姓名] - [角色]：[特点]
+[姓名] - [角色]：[特点]
+（如果少于3个，列出所有人物）
 
 关键情节点：
-1. [情节点1]
-2. [情节点2]
-3. [情节点3]
-4. [情节点4]
-5. [情节点5]
+- [情节点1]
+- [情节点2]
+- [情节点3]
+- [情节点4]
+- [情节点5]
+（如果少于5个，列出所有情节点）
 
 补充说明：[补充说明]
 """
-    
+
     try:
-        response = Generation.call(
+        # 使用 OpenAI 兼容模式调用 Qwen 模型
+        client = openai.OpenAI(
+            api_key=os.getenv("QWEN_API_KEY"),
+            base_url="https://dashscope.aliyuncs.com/compatible-mode/v1",
+        )
+
+        response = client.chat.completions.create(
             model=os.getenv("QWEN_MODEL_NAME", "qwen3-235b-a22b"),
-            prompt=prompt,
+            messages=[
+                {"role": "system", "content": "你是一个善于创作小说的AI助手。"},
+                {"role": "user", "content": prompt}
+            ],
             temperature=float(os.getenv("QWEN_TEMPERATURE", "0.7")),
             max_tokens=int(os.getenv("QWEN_MAX_TOKENS", "2048")),
-            api_key=os.getenv("QWEN_API_KEY")
+            extra_body={"enable_thinking": False},
         )
-        
-        if response.status_code == 200:
+
+        if response.choices and response.choices[0].message.content:
             # 解析 AI 生成的文本
-            generated_text = response.output.text
+            generated_text = response.choices[0].message.content
             lines = generated_text.split('\n')
-            
+
             concept = state['concept']
             current_section = ""
-            
+            temp_characters = [] # 临时存储人物列表
+            temp_plot_points = [] # 临时存储情节点列表
+
             for line in lines:
                 line = line.strip()
                 if not line:
                     continue
-                    
+
                 if line.startswith('标题：'):
                     concept.title = line[3:].strip()
                 elif line.startswith('类型：'):
                     concept.genre = line[3:].strip()
                 elif line.startswith('主题：'):
-                    concept.main_theme = line[3:].strip()
+                    concept.logline = line[3:].strip()
                 elif line.startswith('目标读者：'):
                     concept.target_audience = line[5:].strip()
                 elif line.startswith('背景设定：'):
                     concept.setting = line[5:].strip()
                 elif line.startswith('写作风格：'):
-                    concept.style = line[5:].strip()
+                    concept.style_and_tone = line[5:].strip()
                 elif line.startswith('预计字数：'):
                     try:
-                        concept.word_count_target = int(line[5:].strip())
+                        concept.word_count_target = int(''.join(filter(str.isdigit, line[5:].strip())))
                     except ValueError:
                         concept.word_count_target = 50000  # 默认值
                 elif line == '主要人物：':
                     current_section = 'characters'
                 elif line == '关键情节点：':
                     current_section = 'plot'
-                elif line == '补充说明：':
+                elif line.startswith('补充说明：'):
                     current_section = 'notes'
-                elif current_section == 'characters' and line[0].isdigit():
-                    try:
-                        name_role, traits = line.split('：', 1)
-                        name, role = name_role.split(' - ', 1)
-                        concept.main_characters.append({
-                            "name": name.strip(),
-                            "role": role.strip(),
-                            "traits": traits.strip()
-                        })
-                    except ValueError:
-                        continue
-                elif current_section == 'plot' and line[0].isdigit():
-                    try:
-                        point = line.split('.', 1)[1].strip()
-                        concept.key_plot_points.append(point)
-                    except IndexError:
-                        continue
+                    concept.additional_notes = line[5:].strip() # 直接获取补充说明的第一行
+                elif current_section == 'characters' and ' - ' in line and '：' in line:
+                     try:
+                         parts = line.split('：', 1)
+                         name_role = parts[0].strip()
+                         traits = parts[1].strip() if len(parts) > 1 else ""
+                         name, role = name_role.split(' - ', 1)
+                         temp_characters.append({
+                             "name": name.strip(),
+                             "role": role.strip(),
+                             "traits": traits
+                         })
+                     except ValueError:
+                         continue # 忽略格式不符的行
+                elif current_section == 'plot' and line.startswith('- '):
+                    temp_plot_points.append(line[2:].strip())
                 elif current_section == 'notes':
-                    concept.additional_notes += line + '\n'
-            
+                     concept.additional_notes += '\n' + line # 追加补充说明的其他行
+
+            # 更新列表字段
+            concept.main_characters = temp_characters
+            concept.key_plot_points = temp_plot_points
+
             print("AI 已生成小说概念，请查看并确认。")
         else:
             print("AI 生成失败，请手动输入小说概念。")
+            # 恢复到手动输入流程
+            state['user_input'] = "AI生成失败"
             return collect_initial_concept(state)
-            
+
     except Exception as e:
         print(f"AI 生成出错：{str(e)}")
         print("请手动输入小说概念。")
+        # 恢复到手动输入流程
+        state['user_input'] = f"AI生成出错：{str(e)}"
         return collect_initial_concept(state)
-    
+
     return state
 
 def collect_initial_concept(state: ConceptState) -> ConceptState:
@@ -213,10 +234,10 @@ def collect_initial_concept(state: ConceptState) -> ConceptState:
     
     state['concept'].title = input("1. 小说的暂定标题是什么？")
     state['concept'].genre = input("2. 您期望的小说类型是什么？（如：奇幻、科幻、言情等）")
-    state['concept'].main_theme = input("3. 小说的主要主题是什么？")
+    state['concept'].logline = input("3. 故事的一句话概括是什么？")
     state['concept'].target_audience = input("4. 目标读者群体是？")
     state['concept'].setting = input("5. 故事发生的背景设定是？")
-    state['concept'].style = input("6. 期望的写作风格是？（如：轻松、严肃、悬疑等）")
+    state['concept'].style_and_tone = input("6. 期望的写作风格是？（如：轻松、严肃、悬疑等）")
     state['concept'].word_count_target = int(input("7. 预计字数目标是多少？"))
     
     print("\n8. 请描述主要人物（每行一个，格式：姓名,角色,特点）：")
@@ -238,7 +259,7 @@ def collect_initial_concept(state: ConceptState) -> ConceptState:
             break
         state['concept'].key_plot_points.append(plot_point)
     
-    state['concept'].additional_notes = input("\n10. 其他补充说明：")
+    state['user_input'] = input("\n10. 其他补充说明：")
     return state
 
 def summarize_concept(state: ConceptState) -> ConceptState:
@@ -247,10 +268,10 @@ def summarize_concept(state: ConceptState) -> ConceptState:
     print("\n=== 当前小说概念总结 ===")
     print(f"标题：{concept.title}")
     print(f"类型：{concept.genre}")
-    print(f"主题：{concept.main_theme}")
+    print(f"主题：{concept.logline}")
     print(f"目标读者：{concept.target_audience}")
     print(f"背景设定：{concept.setting}")
-    print(f"写作风格：{concept.style}")
+    print(f"写作风格：{concept.style_and_tone}")
     print(f"目标字数：{concept.word_count_target}")
     
     print("\n主要人物：")
@@ -277,21 +298,21 @@ def get_user_feedback(state: ConceptState) -> ConceptState:
     choice = input("\n请选择（1-3）：")
     
     if choice == "1":
-        state['is_confirmed'] = True
-        state['feedback'] = "用户确认概念"
+        state['feedback_needed'] = False
+        state['user_input'] = "用户确认概念"
     elif choice == "2":
-        state['is_confirmed'] = False
-        state['feedback'] = input("请说明需要修改的部分：")
+        state['feedback_needed'] = True
+        state['user_input'] = input("请说明需要修改的部分：")
     else:
-        state['is_confirmed'] = False
-        state['feedback'] = "重新开始"
+        state['feedback_needed'] = True
+        state['user_input'] = "重新开始"
         state['iteration_count'] = 0
     
     return state
 
 def modify_concept(state: ConceptState) -> ConceptState:
     """根据反馈修改概念"""
-    if state['feedback'] == "重新开始":
+    if state['user_input'] == "重新开始":
         return collect_initial_concept(state)
     
     print("\n=== 修改概念 ===")
@@ -315,13 +336,13 @@ def modify_concept(state: ConceptState) -> ConceptState:
     elif choice == "2":
         concept.genre = input("新的类型：")
     elif choice == "3":
-        concept.main_theme = input("新的主题：")
+        concept.logline = input("新的主题：")
     elif choice == "4":
         concept.target_audience = input("新的目标读者：")
     elif choice == "5":
         concept.setting = input("新的背景设定：")
     elif choice == "6":
-        concept.style = input("新的写作风格：")
+        concept.style_and_tone = input("新的写作风格：")
     elif choice == "7":
         concept.word_count_target = int(input("新的目标字数："))
     elif choice == "8":
@@ -371,41 +392,42 @@ def modify_concept(state: ConceptState) -> ConceptState:
     return state
 
 def should_continue_concept(state: ConceptState) -> str:
-    """决定是否继续概念收集流程"""
-    if state['is_confirmed']:
-        return "confirmed"
-    if state['iteration_count'] >= 10:  # 设置最大迭代次数
-        print("\n已达到最大修改次数，将使用当前版本继续。")
-        return "confirmed"
-    return "continue"
+    """判断是否需要继续概念收集"""
+    if state.get('feedback_needed', False):
+        return "need_feedback"
+    return "confirmed"
 
 # 创建工作流图
 def create_novel_workflow() -> StateGraph:
+    """创建小说创作工作流"""
     workflow = StateGraph(NovelState)
     
     # 添加节点
     workflow.add_node("discuss_outline", discuss_outline)
     workflow.add_node("create_draft", create_initial_draft)
-    workflow.add_node("save_draft", save_draft)
+    workflow.add_node("save", save_draft)
     workflow.add_node("modify_outline", modify_outline)
     workflow.add_node("modify_content", modify_content)
+    workflow.add_node("should_continue", should_continue)
     
     # 设置边
     workflow.add_edge("discuss_outline", "create_draft")
-    workflow.add_edge("create_draft", "save_draft")
-    workflow.add_edge("save_draft", should_continue)
-    workflow.add_edge("modify_outline", "modify_content")
-    workflow.add_edge("modify_content", "save_draft")
-    
-    # 设置条件分支
+    workflow.add_edge("create_draft", "save")
+    workflow.add_edge("save", "should_continue")
     workflow.add_conditional_edges(
-        "save_draft",
+        "should_continue",
         should_continue,
         {
-            "continue": "modify_outline",
-            "end": END
+            "modify_outline": "modify_outline",
+            "modify_content": "modify_content",
+            "completed": END # 使用END表示终止
         }
     )
+    workflow.add_edge("modify_outline", "create_draft")
+    workflow.add_edge("modify_content", "save")
+    
+    # 设置入口
+    workflow.set_entry_point("discuss_outline")
     
     return workflow
 
@@ -414,57 +436,122 @@ def create_concept_workflow() -> StateGraph:
     workflow = StateGraph(ConceptState)
     
     # 添加节点
-    workflow.add_node("collect_initial", collect_initial_concept)
+    workflow.add_node("collect_concept", collect_initial_concept)
     workflow.add_node("summarize", summarize_concept)
     workflow.add_node("get_feedback", get_user_feedback)
     workflow.add_node("modify", modify_concept)
+    workflow.add_node("should_continue", should_continue_concept)
     
     # 设置边
-    workflow.add_edge("collect_initial", "summarize")
-    workflow.add_edge("summarize", "get_feedback")
-    workflow.add_edge("get_feedback", should_continue_concept)
-    workflow.add_edge("modify", "summarize")
-    
-    # 设置条件分支
+    workflow.add_edge("collect_concept", "summarize")
+    workflow.add_edge("summarize", "should_continue")
     workflow.add_conditional_edges(
-        "get_feedback",
+        "should_continue",
         should_continue_concept,
         {
-            "confirmed": END,
-            "continue": "modify"
+            "need_feedback": "get_feedback",
+            "confirmed": END # 使用END表示终止
         }
     )
+    workflow.add_edge("get_feedback", "modify")
+    workflow.add_edge("modify", "summarize")
+    
+    # 设置入口
+    workflow.set_entry_point("collect_concept")
     
     return workflow
 
+def save_concept(concept: NovelConcept) -> str:
+    """保存小说概念到文件"""
+    # 确保工作目录存在
+    working_dir = os.getenv("NOVEL_WORKING_DIR", "./novels")
+    os.makedirs(working_dir, exist_ok=True)
+    
+    # 生成文件名
+    filename = f"{concept.title}_concept.txt"
+    filepath = os.path.join(working_dir, filename)
+    
+    # 写入文件
+    with open(filepath, "w", encoding="utf-8") as f:
+        f.write(f"标题：{concept.title}\n")
+        f.write(f"类型：{concept.genre}\n")
+        f.write(f"目标读者：{concept.target_audience}\n")
+        f.write(f"背景设定：{concept.setting}\n")
+        f.write(f"写作风格：{concept.style_and_tone}\n")
+        f.write(f"目标字数：{concept.word_count_target}\n\n")
+        
+        f.write("主要人物：\n")
+        for character in concept.main_characters:
+            f.write(f"- {character['name']}：{character['description']}\n")
+        
+        f.write("\n关键情节点：\n")
+        for point in concept.key_plot_points:
+            f.write(f"- {point}\n")
+        
+        if concept.additional_notes:
+            f.write(f"\n补充说明：{concept.additional_notes}\n")
+    
+    print(f"小说概念已保存到：{filepath}")
+    return filepath
+
+def save_draft(state: NovelState) -> str:
+    """保存小说草稿到文件"""
+    # 确保工作目录存在
+    working_dir = os.getenv("NOVEL_WORKING_DIR", "./novels")
+    os.makedirs(working_dir, exist_ok=True)
+    
+    # 生成文件名
+    filename = f"{state['concept'].title}_draft.txt"
+    filepath = os.path.join(working_dir, filename)
+    
+    # 写入文件
+    with open(filepath, "w", encoding="utf-8") as f:
+        f.write(f"=== {state['concept'].title} ===\n\n")
+        f.write(f"大纲：\n{state['outline']}\n\n")
+        f.write(f"内容：\n{state['draft_content']}\n")
+        
+    print(f"小说草稿已保存到：{filepath}")
+    return filepath
+
+# 导出所有需要的函数和类
+__all__ = [
+    "NovelConcept",
+    "NovelState",
+    "create_concept_workflow",
+    "create_novel_workflow",
+    "generate_concept_with_ai",
+    "save_concept",
+    "save_draft"
+]
+
 if __name__ == "__main__":
-    # 创建概念收集工作流
+    # 创建概念工作流
     concept_workflow = create_concept_workflow()
+    compiled_concept_workflow = concept_workflow.compile()
     
-    # 初始化概念状态
-    initial_concept_state = ConceptState(
-        concept=NovelConcept(),
-        is_confirmed=False,
-        feedback="",
-        iteration_count=0
-    )
-    
-    # 运行概念收集工作流
-    final_concept = concept_workflow.run(initial_concept_state)
-    
-    # 创建小说写作工作流
+    # 创建小说工作流
     novel_workflow = create_novel_workflow()
+    compiled_novel_workflow = novel_workflow.compile()
     
-    # 初始化小说状态
-    initial_novel_state = NovelState(
-        project_name=final_concept['concept'].title,
-        outline="",
-        content="",
-        current_chapter=1,
-        total_chapters=1,
-        working_dir=os.getenv("NOVEL_WORKING_DIR", "./novels"),
-        mode="new"
-    )
+    # 运行概念工作流
+    concept_state = {
+        'concept': NovelConcept(),
+        'user_input': '',
+        'feedback_needed': True
+    }
+    concept_result = compiled_concept_workflow.invoke(concept_state)
     
-    # 运行小说写作工作流
-    result = novel_workflow.run(initial_novel_state) 
+    # 如果概念被确认，运行小说工作流
+    if not concept_result.get('feedback_needed', True):
+        novel_state = {
+            'concept': concept_result['concept'],
+            'outline': '',
+            'draft_content': '',
+            'current_section': '',
+            'save_path': '',
+            'user_feedback': ''
+        }
+        novel_result = compiled_novel_workflow.invoke(novel_state)
+        print("\n=== 小说创作完成 ===")
+        print(f"大纲：\n{novel_result['outline']}")
+        print(f"\n内容：\n{novel_result['draft_content']}") 
